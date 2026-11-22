@@ -31,6 +31,7 @@ class OriginState:
     delay_ms: int = 0
     fail_next: int = 0  # 接下来 N 个内容请求返回 500
     inflight: int = 0  # 当前正在处理（含延迟等待）的内容请求数
+    revision: int = 0  # 正文版本：递增后渲染内容与 ETag 同时变化，用于演示代理换正文
     counters: dict = field(default_factory=lambda: {"requests": 0, "status304": 0, "status200": 0, "status500": 0})
 
 
@@ -98,9 +99,14 @@ def _render(fmt: str, lang: str) -> bytes:
             }
             for r in RELEASES
         ]
+        # revision 写进正文：换代后字节真实变化，代理 200 换正文可被客户端观察到
+        if state.revision:
+            payload.append({"revision": state.revision})
         return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
     lines = [f"# {RELEASES[0][lang]['title']}", ""]
+    if state.revision:
+        lines += [f"<!-- revision: {state.revision} -->", ""]
     for r in RELEASES:
         lines += [
             f"## {r['version']} — {r['date']}",
@@ -114,9 +120,9 @@ def _render(fmt: str, lang: str) -> bytes:
 
 
 def _etag(fmt: str, lang: str) -> str:
-    # ETag 只与实际表示（格式+语言+内容）相关，不随 Vary 规则变化，
-    # 这样规则切换后同一表示的条件复验仍可返回 304
-    digest = hashlib.sha1(f"{fmt}:{lang}".encode()).hexdigest()[:16]
+    # ETag 与实际表示（格式+语言+正文版本）相关，不随 Vary 规则变化；
+    # revision 递增后同表示的条件复验会拿到 200（正文换代）而不是 304
+    digest = hashlib.sha1(f"{fmt}:{lang}:{state.revision}".encode()).hexdigest()[:16]
     return f'"{digest}"'
 
 
@@ -207,8 +213,16 @@ async def admin_get_state() -> dict:
         "delay_ms": state.delay_ms,
         "fail_next": state.fail_next,
         "inflight": state.inflight,
+        "revision": state.revision,
         "counters": state.counters,
     }
+
+
+@app.post("/admin/rev")
+async def admin_bump_revision() -> dict:
+    """正文换代：渲染内容与 ETag 同时变化（不改变 Vary 规则）。"""
+    state.revision += 1
+    return {"ok": True, "revision": state.revision}
 
 
 @app.post("/admin/vary/{mode}")
@@ -245,5 +259,6 @@ async def admin_reset() -> dict:
     state.delay_ms = 0
     state.fail_next = 0
     state.inflight = 0
+    state.revision = 0
     state.counters = {"requests": 0, "status304": 0, "status200": 0, "status500": 0}
     return {"ok": True}
